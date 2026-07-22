@@ -73,11 +73,24 @@ Generic matter, Electrons, Protons, Neutrons, Up/Down Quarks, Positrons, Black H
 ./tephron
 ```
 
+### Debian / Ubuntu / Mint
+
+Download the `amd64.deb` from the latest GitHub Release, then install it with:
+
+```bash
+sudo apt install ./tephron_*_amd64.deb
+```
+
+The release package is built on Debian 11 for compatibility with current
+Debian, Ubuntu, Linux Mint, and their derivatives. A Vulkan-capable GPU and
+driver are required; the simulator also has a reduced-fidelity software Vulkan
+mode for testing.
+
 ## Command Line
 | Flag | Effect |
 |------|--------|
 | `--selftest` | Run numerical verification (energy/momentum conservation, far-field accuracy, merging) and exit |
-| `--preset K` | Start with preset K (0-12) |
+| `--preset K` | Start with preset K (0-18) |
 | `--particles N` | Override particle count |
 | `--frames N` | Exit after N frames (headless testing) |
 | `--fixed-dt X` | Deterministic timestep |

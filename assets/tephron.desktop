@@ -2,9 +2,7 @@
 Type=Application
 Name=Tephron
 Comment=Vulkan N-body simulator with black holes, pulsars, and a GW observatory
-# Adjust paths to your install location, then copy to ~/.local/share/applications/
-Exec=/opt/tephron/tephron
-Path=/opt/tephron
-Icon=/opt/tephron/assets/icon-256.png
+Exec=tephron
+Icon=tephron
 Terminal=false
 Categories=Science;Education;Physics;

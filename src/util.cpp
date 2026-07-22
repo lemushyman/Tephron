@@ -72,13 +72,32 @@ void createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyF
 }
 
 std::vector<char> readFile(const std::string& filename) {
-    std::ifstream file(filename, std::ios::ate | std::ios::binary);
-    if (!file.is_open()) return {};
-    size_t fileSize = (size_t)file.tellg();
-    std::vector<char> buffer(fileSize);
-    file.seekg(0);
-    file.read(buffer.data(), fileSize);
-    return buffer;
+    // Keep the source-tree workflow convenient, but also support distro
+    // packages launched from an arbitrary working directory. SDL resolves
+    // the real executable location even when /usr/bin/tephron is a symlink.
+    std::vector<std::string> candidates{filename};
+    if (const char* dataDir = getenv("TEPHRON_DATA_DIR")) {
+        std::string root(dataDir);
+        if (!root.empty() && root.back() != '/') root += '/';
+        candidates.push_back(root + filename);
+    }
+    if (char* base = SDL_GetBasePath()) {
+        candidates.push_back(std::string(base) + filename);
+        SDL_free(base);
+    }
+
+    for (const std::string& candidate : candidates) {
+        std::ifstream file(candidate, std::ios::ate | std::ios::binary);
+        if (!file.is_open()) continue;
+        size_t fileSize = (size_t)file.tellg();
+        std::vector<char> buffer(fileSize);
+        file.seekg(0);
+        file.read(buffer.data(), fileSize);
+        return buffer;
+    }
+
+    fprintf(stderr, "Unable to find Tephron resource: %s\n", filename.c_str());
+    return {};
 }
 
 VkShaderModule createShaderModule(const std::vector<char>& code) {

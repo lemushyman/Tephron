@@ -3,3 +3,4 @@ shaders/*.spv
 screenshots/
 saves/
 *.bmp
+dist/

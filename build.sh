@@ -134,9 +134,9 @@ VULKAN_LIBS=$(pkg-config --libs vulkan 2>/dev/null || echo "-lvulkan")
 
 # Compile application
 echo "Compiling application..."
-echo "  g++ -std=c++17 -O3 -march=native src/*.cpp ..."
+echo "  g++ -std=c++17 -O3 -mtune=generic src/*.cpp ..."
 
-g++ -std=c++17 -O3 -march=native \
+g++ -std=c++17 -O3 -mtune=generic \
     -Wall -Wextra -Wno-missing-field-initializers \
     src/*.cpp \
     -o tephron \
