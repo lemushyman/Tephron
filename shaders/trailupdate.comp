@@ -1,0 +1,69 @@
+#version 450
+
+// ============================================================
+// GPU TRAIL RING-BUFFER UPDATE
+//
+// One thread per particle: stamp the current position into the
+// trail ring buffer at the current head slot. Replaces the old
+// CPU path (full readback + O(N*len) shift + re-upload every
+// couple of frames, each with a queue stall).
+// ============================================================
+
+layout(local_size_x = 256) in;
+
+struct Particle {
+    vec4 posM;   // position.xyz + mass
+    vec4 vel;    // velocity.xyz + charge
+    vec4 color;  // rgb + particle type
+};
+
+layout(std430, binding = 0) readonly buffer Particles {
+    Particle particles[];
+};
+
+layout(binding = 1) uniform SimUBO {
+    float G;
+    float softening;
+    float dt;
+    int numParticles;
+    int gravityType;
+    float darkMatterStrength;
+    int darkMatterEnabled;
+    float simTime;
+    float damping;
+    float centralMass;
+    float boundaryRadius;
+    int boundaryMode;
+    int gravityEnabled;
+    int emEnabled;
+    int strongForceEnabled;
+    float emStrength;
+    float strongStrength;
+    float strongRange;
+    int relativityEnabled;
+    int expansionEnabled;
+    float speedOfLight;
+    float hubbleConstant;
+};
+
+layout(std430, binding = 5) writeonly buffer TrailBuf {
+    vec4 trails[];   // xyz = position, w = 1.0 once written (-1 = never filled)
+};
+
+layout(std430, binding = 6) readonly buffer TrailRowMap {
+    int rowMap[];    // particle index -> trail buffer row
+};
+
+layout(push_constant) uniform TrailPush {
+    int head;
+    int trailLen;
+} tp;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(numParticles)) return;
+    // Consumed particles (mass 0) stamp invalid slots so their trail fades out
+    bool dead = particles[i].posM.w <= 0.0;
+    trails[uint(rowMap[i]) * uint(tp.trailLen) + uint(tp.head)] =
+        dead ? vec4(0.0, 0.0, 0.0, -1.0) : vec4(particles[i].posM.xyz, 1.0);
+}

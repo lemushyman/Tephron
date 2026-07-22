@@ -1,0 +1,5 @@
+tephron
+shaders/*.spv
+screenshots/
+saves/
+*.bmp

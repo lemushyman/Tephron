@@ -1,0 +1,797 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+struct Particle {
+    vec4 posM;   // position.xyz + mass
+    vec4 vel;    // velocity.xyz + charge (-1 to +1, 0=neutral)
+    vec4 color;  // rgb + particle type
+};
+
+layout(std430, binding = 0) buffer Particles {
+    Particle particles[];
+};
+
+layout(binding = 1) uniform SimUBO {
+    float G;
+    float softening;
+    float dt;
+    int numParticles;
+    int gravityType;
+    float darkMatterStrength;
+    int darkMatterEnabled;
+    float simTime;
+    float damping;
+    float centralMass;
+    float boundaryRadius;
+    int boundaryMode;
+    // New force parameters
+    int gravityEnabled;
+    int emEnabled;
+    int strongForceEnabled;
+    float emStrength;
+    float strongStrength;
+    float strongRange;
+    // Relativistic and cosmological parameters
+    int relativityEnabled;
+    int expansionEnabled;
+    float speedOfLight;
+    float hubbleConstant;
+};
+
+// Previous-step acceleration (xyz) + gravitational potential (w).
+// Persisted across frames for velocity Verlet integration.
+layout(std430, binding = 2) buffer AccBuffer {
+    vec4 accbuf[];
+};
+
+// Tile summary data produced by tilecom.comp.
+//   [0 .. 2T):                     per-tile aggregates: (COM, mass), (radius, net charge, -, -)
+//   [2*MAX_TILES_STORE + t*16 ..): eight 32-particle sub-monopoles per tile,
+//                                  each (COM, mass), (radius, net charge, -, -)
+// MAX_TILES_STORE must match (MAX_PARTICLES + 255) / 256 on the C++ side.
+const uint MAX_TILES_STORE = 1954u;
+layout(std430, binding = 3) readonly buffer TileCOM {
+    vec4 tilecom[];
+};
+
+// Per-workgroup diagnostic partial sums, read back by the CPU:
+//   diag[4*wg]   = (kinetic energy, potential energy, total mass, particle count)
+//   diag[4*wg+1] = (momentum.xyz, sum of speeds)
+//   diag[4*wg+2] = mass quadrupole (Qxx, Qyy, Qzz, Qxy)
+//   diag[4*wg+3] = mass quadrupole (Qxz, Qyz, -, -)
+// The quadrupole feeds the gravitational wave observatory: the CPU takes
+// d^2Q/dt^2 (quadrupole formula) to produce the h+ / hx strain traces.
+layout(std430, binding = 4) writeonly buffer DiagBuffer {
+    vec4 diag[];
+};
+
+// Per-frame black hole channel, read by the CPU right after the compute
+// fence: exact positions every frame (no scans, no extrapolation).
+//   data[2s]   = (pos.xyz, mass)
+//   data[2s+1] = (gid, charge, spin, 0)
+layout(std430, binding = 11) buffer BHOut {
+    ivec4 bhOutCount;   // x = number of emitted black holes
+    vec4 bhOutData[32];
+};
+
+// CPU-uploaded black hole list (last frame's holes) for consumption and
+// growth. Eaten mass/momentum accumulates in fixed-point atomics; the CPU
+// converts them to growth entries for the NEXT frame, applied exactly once
+// by each hole's own thread.
+layout(std430, binding = 12) buffer BHSim {
+    ivec4 bhSimCount;        // x = count
+    vec4 bhSimPosRad[16];    // xyz = position, w = capture radius
+    ivec4 bhSimGid[16];      // x = particle gid of this hole
+    vec4 bhSimGrowth[16];    // dMass, dPx, dPy, dPz to apply this frame
+    ivec4 bhEatAcc[16];      // atomics: x = dMass<<8, yzw = dP<<4
+};
+
+// Trail ring buffer + row map (also bound for trailupdate.comp): when a
+// particle is consumed, its whole trail row is wiped here so nothing is
+// left to pop out visually when the population sweep later removes it.
+layout(std430, binding = 5) writeonly buffer TrailBuf {
+    vec4 trails[];
+};
+layout(std430, binding = 6) readonly buffer TrailRowMap {
+    int trailRow[];
+};
+
+layout(push_constant) uniform PhysPush {
+    int emitBH;       // 1 on the final substep: emit BHOut entries
+    int applyGrowth;  // 1 on the first substep: holes apply queued growth
+} pp;
+
+// ============================================================
+// HYBRID FAR-FIELD N-BODY
+//
+// Small sims (<=128 tiles): exact all-pairs via shared-memory
+// tiles, as before.
+//
+// Large sims: every tile contributes a deterministic monopole
+// (from tilecom.comp), and a strided sample of tiles is
+// processed exactly. The sampled exact-minus-monopole residual
+// is scaled up as an unbiased control-variate correction:
+//
+//   acc = sum_all mono(t) + (T/S) * sum_sampled [exact(t) - mono(t)]
+//
+// The residual of a far tile is tiny, so the estimator variance
+// collapses compared to pure stochastic tile sampling, while the
+// bulk far-field is exact-to-monopole and completely stable.
+// (The particle's own tile monopole includes its own mass; the
+// resulting self-term is O(1/256) of one tile's force and decays
+// with the correction scaling - negligible.)
+// ============================================================
+shared vec4 sh_posM[256];    // position + mass
+shared float sh_charge[256]; // charge (from vel.w)
+shared float sh_ptype[256];  // particle type (from color.w)
+shared float sh_spin[256];   // black hole spin (from color.r; 0 otherwise)
+
+// Gravity type constants
+const int GRAVITY_NEWTONIAN = 0;
+const int GRAVITY_INV_LINEAR = 1;
+const int GRAVITY_LINEAR = 2;
+const int GRAVITY_CONSTANT = 3;
+const int GRAVITY_REPULSIVE = 4;
+const int GRAVITY_OSCILLATING = 5;
+const int GRAVITY_INVERSE_CUBE = 6;
+const int GRAVITY_LOGARITHMIC = 7;
+const int GRAVITY_YUKAWA = 8;
+const int GRAVITY_LENNARD_JONES = 9;
+const int GRAVITY_SPIRAL = 10;
+const int GRAVITY_PULSE = 11;
+const int GRAVITY_QUANTIZED = 12;
+const int GRAVITY_FUNNEL = 13;
+const int GRAVITY_VORTEX = 14;
+const int GRAVITY_RUBBER_BAND = 15;
+
+// Particle type constants
+const int PTYPE_GENERIC = 0;
+const int PTYPE_ELECTRON = 1;
+const int PTYPE_PROTON = 2;
+const int PTYPE_NEUTRON = 3;
+const int PTYPE_UP_QUARK = 4;
+const int PTYPE_DOWN_QUARK = 5;
+const int PTYPE_POSITRON = 6;
+
+// Check if particle feels the strong force
+// Quarks feel it strongly, nucleons (p/n) feel residual, leptons don't
+float getStrongForceFactor(int ptype) {
+    if (ptype == PTYPE_UP_QUARK || ptype == PTYPE_DOWN_QUARK) return 1.0;  // Full strength
+    if (ptype == PTYPE_PROTON || ptype == PTYPE_NEUTRON) return 0.3;       // Residual
+    return 0.0;  // Electrons, positrons, generic don't feel it
+}
+
+// Simple hash for pseudo-random tile offset
+uint hash(uint x) {
+    x ^= x >> 16;
+    x *= 0x85ebca6bu;
+    x ^= x >> 13;
+    x *= 0xc2b2ae35u;
+    x ^= x >> 16;
+    return x;
+}
+
+// Calculate gravitational force magnitude based on gravity type
+// Returns radial force (positive = attractive toward other particle)
+float calcGravityMag(float mass_j, float dist, float dist_sq) {
+    float force = 0.0;
+
+    switch (gravityType) {
+        case GRAVITY_NEWTONIAN:
+            force = G * mass_j / dist_sq;
+            break;
+        case GRAVITY_INV_LINEAR:
+            force = G * mass_j / dist;
+            break;
+        case GRAVITY_LINEAR:
+            force = G * mass_j * dist * 0.001;
+            break;
+        case GRAVITY_CONSTANT:
+            force = G * mass_j * 0.1;
+            break;
+        case GRAVITY_REPULSIVE:
+            force = -G * mass_j / dist_sq;
+            break;
+        case GRAVITY_OSCILLATING:
+            force = G * mass_j / dist_sq * sin(simTime * 2.0);
+            break;
+        case GRAVITY_INVERSE_CUBE:
+            force = G * mass_j / (dist_sq * dist);
+            break;
+        case GRAVITY_LOGARITHMIC:
+            force = G * mass_j * log(dist + 1.0) / dist * 0.5;
+            break;
+        case GRAVITY_YUKAWA:
+            force = G * mass_j / dist_sq * exp(-dist / 50.0);
+            break;
+        case GRAVITY_LENNARD_JONES:
+            {
+                float sigma = 5.0;
+                float sigma6 = sigma * sigma * sigma * sigma * sigma * sigma;
+                float r6 = dist_sq * dist_sq * dist_sq;
+                float r7 = r6 * dist;
+                float r13 = r6 * r6 * dist;
+                force = G * mass_j * (12.0 * sigma6 * sigma6 / r13 - 6.0 * sigma6 / r7) * 0.01;
+            }
+            break;
+        case GRAVITY_SPIRAL:
+            // Spiral: normal gravity + handled tangentially in main loop
+            force = G * mass_j / dist_sq * 0.5;
+            break;
+        case GRAVITY_PULSE:
+            // Dramatic pulsing between strong attract and strong repel
+            {
+                float pulse = sin(simTime * 5.0) * sin(simTime * 0.7);
+                force = G * mass_j / dist_sq * (1.0 + pulse * 2.0);
+            }
+            break;
+        case GRAVITY_QUANTIZED:
+            // Gravity only at certain shell distances (quantum-like)
+            {
+                float shellSize = 30.0;
+                float shellPhase = mod(dist, shellSize) / shellSize;
+                float shellStrength = exp(-pow(shellPhase - 0.5, 2.0) * 20.0);
+                force = G * mass_j / dist_sq * shellStrength * 3.0;
+            }
+            break;
+        case GRAVITY_FUNNEL:
+            // Strong at specific radius, creates rings
+            {
+                float sweetSpot = 80.0;
+                float funnelStrength = exp(-pow(dist - sweetSpot, 2.0) / 2000.0);
+                force = G * mass_j / dist_sq * (0.3 + funnelStrength * 3.0);
+                // Slight repulsion inside the ring
+                if (dist < sweetSpot * 0.7) force -= G * mass_j / dist_sq * 0.5;
+            }
+            break;
+        case GRAVITY_VORTEX:
+            // Vortex: inward spiral - radial component (tangential in main loop)
+            force = G * mass_j / dist_sq * 0.7;
+            break;
+        case GRAVITY_RUBBER_BAND:
+            // Rubber band: weak close, strong at medium range, then snaps
+            {
+                float optimal = 50.0;
+                float stretch = dist / optimal;
+                if (stretch < 1.0) {
+                    // Compressed: weak or repulsive
+                    force = G * mass_j * (stretch - 1.0) * 0.1;
+                } else if (stretch < 3.0) {
+                    // Stretched: strong attractive, increases with distance
+                    force = G * mass_j * pow(stretch - 1.0, 2.0) * 0.05;
+                } else {
+                    // Snapped: falls off quickly
+                    force = G * mass_j / dist_sq * 0.3;
+                }
+            }
+            break;
+        default:
+            force = G * mass_j / dist_sq;
+    }
+
+    // Loose per-pair clamp: keeps exotic force types from exploding while
+    // leaving realistic central-mass gravity intact (a tight clamp starved
+    // inner Keplerian orbits of centripetal force, ejecting whole disks).
+    // The total-acceleration clamp plus adaptive substepping are the real
+    // stability guards.
+    return clamp(force, -5000.0, 5000.0);
+}
+
+// Calculate tangential force for spiral/vortex gravity types
+// Returns perpendicular force component (for swirling motion)
+vec3 calcTangentialForce(vec3 d, float dist, float mass_j) {
+    if (gravityType != GRAVITY_SPIRAL && gravityType != GRAVITY_VORTEX) {
+        return vec3(0.0);
+    }
+
+    // Get a perpendicular direction (cross with up, or another axis if parallel)
+    vec3 up = vec3(0.0, 1.0, 0.0);
+    vec3 tangent = cross(d, up);
+    if (length(tangent) < 0.001) {
+        tangent = cross(d, vec3(1.0, 0.0, 0.0));
+    }
+    tangent = normalize(tangent);
+
+    float tangentForce = 0.0;
+    if (gravityType == GRAVITY_SPIRAL) {
+        // Gentle spiral - creates beautiful galaxy-like swirls
+        tangentForce = G * mass_j / (dist * dist) * 0.3;
+    } else if (gravityType == GRAVITY_VORTEX) {
+        // Strong vortex - dramatic whirlpool effect
+        tangentForce = G * mass_j / dist * 0.5;
+        // Speed up as particles get closer (conservation of angular momentum feel)
+        tangentForce *= 50.0 / (dist + 10.0);
+    }
+
+    return tangent * clamp(tangentForce, -50.0, 50.0);
+}
+
+// Calculate electromagnetic force (Coulomb's law)
+// F = k * q1 * q2 / r^2 (repels like charges, attracts opposite)
+float calcEMForce(float charge_i, float charge_j, float dist_sq) {
+    // Negative product = attraction, positive = repulsion
+    float force = -emStrength * charge_i * charge_j / dist_sq;
+    return clamp(force, -200.0, 200.0);
+}
+
+// Calculate strong nuclear force (very short range, attractive then repulsive)
+// Based on Yukawa potential with hard core repulsion
+float calcStrongForce(float dist) {
+    if (dist > strongRange * 3.0) return 0.0;  // Cut off at 3x range
+
+    // Attractive at medium range, repulsive at very short range
+    float attraction = strongStrength * exp(-dist / strongRange) / (dist + 0.5);
+    float repulsion = strongStrength * 5.0 * exp(-dist * 2.0 / strongRange) / (dist + 0.1);
+
+    return clamp(attraction - repulsion, -500.0, 500.0);
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint lid = gl_LocalInvocationID.x;
+    uint wg = gl_WorkGroupID.x;
+
+    // All threads participate in tile loading (even inactive ones past numParticles)
+    // to satisfy the barrier() requirement that all workgroup invocations reach it
+    bool isActive = (gid < uint(numParticles));
+
+    vec3 pos_i = isActive ? particles[gid].posM.xyz : vec3(0.0);
+    float mass_i = isActive ? particles[gid].posM.w : 0.0;
+    vec3 vel_i = isActive ? particles[gid].vel.xyz : vec3(0.0);
+    float charge_i = isActive ? particles[gid].vel.w : 0.0;
+    int ptype_i = isActive ? int(particles[gid].color.w) : 0;
+
+    float soft_sq = softening * softening;
+    float strong_factor_i = (isActive && strongForceEnabled != 0) ? getStrongForceFactor(ptype_i) : 0.0;
+
+    // ============================================================
+    // BLACK HOLE ACCRETION (GPU-native)
+    // ============================================================
+    if (isActive && mass_i > 0.0) {
+        // Compact objects apply growth queued from last frame's meals
+        if (pp.applyGrowth != 0 && (ptype_i == 7 || ptype_i == 8)) {
+            for (int k = 0; k < bhSimCount.x; k++) {
+                if (bhSimGid[k].x == int(gid)) {
+                    vec4 g = bhSimGrowth[k];
+                    if (g.x > 0.0) {
+                        vec3 newV = (mass_i * vel_i + g.yzw) / (mass_i + g.x);
+                        mass_i += g.x;
+                        vel_i = newV;
+                        particles[gid].posM.w = mass_i;   // writeback preserves .w
+                        // TOV-style limit: an overfed pulsar collapses into
+                        // a black hole (keeps its spin as frame dragging)
+                        if (ptype_i == 8 && mass_i > 24000.0) {
+                            ptype_i = 7;
+                            particles[gid].color.w = 7.0;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        // Anything inside a hole's capture radius is consumed: mass and
+        // momentum are credited to the hole (fixed-point atomics), the
+        // victim is zeroed. Larger holes eat smaller ones.
+        int eater = -1;
+        float eaterMass = 0.0;
+        for (int k = 0; k < bhSimCount.x; k++) {
+            if (bhSimGid[k].x == int(gid)) continue;
+            vec3 dbh = bhSimPosRad[k].xyz - pos_i;
+            float rcap = bhSimPosRad[k].w;
+            if (dot(dbh, dbh) < rcap * rcap) {
+                // holes only fall to strictly bigger holes (ties by gid)
+                if (ptype_i == 7) {
+                    float otherMass = bhSimPosRad[k].w; // capture radius ~ mass proxy
+                    float myRad = 2.0 * G * mass_i / max(speedOfLight * speedOfLight, 1.0);
+                    if (otherMass < myRad || (otherMass == myRad && bhSimGid[k].x > int(gid))) continue;
+                }
+                if (rcap > eaterMass) { eaterMass = rcap; eater = k; }
+            }
+        }
+        if (eater >= 0) {
+            atomicAdd(bhEatAcc[eater].x, int(round(mass_i * 256.0)));
+            atomicAdd(bhEatAcc[eater].y, int(round(mass_i * vel_i.x * 16.0)));
+            atomicAdd(bhEatAcc[eater].z, int(round(mass_i * vel_i.y * 16.0)));
+            atomicAdd(bhEatAcc[eater].w, int(round(mass_i * vel_i.z * 16.0)));
+            mass_i = 0.0;
+            vel_i = vec3(0.0);
+            particles[gid].posM.w = 0.0;
+            // The horizon takes the light with it: wipe the trail row now
+            // (32 = TRAIL_LENGTH; fixed at compile time on the C++ side)
+            uint trow = uint(trailRow[gid]);
+            for (uint tj = 0u; tj < 32u; tj++)
+                trails[trow * 32u + tj] = vec4(0.0, 0.0, 0.0, -1.0);
+        }
+    }
+    // Pulsar wind: beamed radiation pressure along twin precessing
+    // magnetic poles - the lighthouse cones that carve the surroundings
+    vec3 accEnv = vec3(0.0);
+    if (isActive && mass_i > 0.0) {
+        for (int k = 0; k < bhSimCount.x; k++) {
+            if (bhSimGid[k].y != 8 || bhSimGid[k].x == int(gid)) continue;
+            float srate = float(bhSimGid[k].z) / 1024.0;
+            float phase = srate * simTime * 8.0;
+            const float ca = 0.825, sa = 0.565;   // ~34 degree magnetic tilt
+            vec3 axis = vec3(sa * cos(phase), sa * sin(phase), ca);
+            vec3 rp = pos_i - bhSimPosRad[k].xyz;
+            float rl = length(rp) + 1e-3;
+            float cosang = abs(dot(rp / rl, axis));
+            if (cosang > 0.94) {
+                float beam = (cosang - 0.94) / 0.06;
+                accEnv += (rp / rl) * beam * clamp(4.0e5 / (rl * rl + 100.0), 0.0, 400.0);
+            }
+        }
+    }
+
+    bool alive = isActive && mass_i > 0.0;
+
+    // ============================================================
+    // TWO-LEVEL FAR-FIELD TRAVERSAL (deterministic)
+    //
+    // The CPU keeps particles Morton-sorted, so index distance
+    // tracks spatial distance and each run of 32/256 consecutive
+    // particles is a compact clump summarized by tilecom.comp.
+    //
+    //   NEAR: a symmetric +-NEAR_W index window of tiles around the
+    //   particle's own tile, computed exactly via shared-memory
+    //   all-pairs. Symmetry makes these forces exactly
+    //   antisymmetric, so momentum is conserved where forces are
+    //   strongest. Sims with <= 2*NEAR_W+1 tiles are fully exact.
+    //
+    //   FAR: every other tile as eight 32-particle sub-monopoles,
+    //   with per-particle refinement - a sub that is too close or
+    //   too big for its distance (Morton discontinuities can put
+    //   spatial neighbors at far indices) has its 32 particles
+    //   fetched and summed exactly instead. The far loop has no
+    //   barriers, so per-thread branching is safe, and threads in a
+    //   workgroup refine the same subs, so the fetches cache well.
+    // ============================================================
+    vec3 accNear = vec3(0.0);
+    vec3 accFar = vec3(0.0);
+    float phiNear = 0.0;
+    float phiFar = 0.0;
+
+    uint totalTiles = (uint(numParticles) + 255u) / 256u;
+    uint myTile = gl_WorkGroupID.x;
+    const uint NEAR_W = 64u;
+    uint nearLo = (myTile > NEAR_W) ? myTile - NEAR_W : 0u;
+    uint nearHi = min(myTile + NEAR_W, totalTiles - 1u);
+
+    for (uint tile = nearLo; tile <= nearHi; tile++) {
+        {
+            // === Cooperative tile load into shared memory ===
+            // All 256 threads load one particle each (coalesced global reads)
+            uint loadIdx = tile * 256u + lid;
+            if (loadIdx < uint(numParticles)) {
+                sh_posM[lid] = particles[loadIdx].posM;
+                sh_charge[lid] = particles[loadIdx].vel.w;
+                sh_ptype[lid] = particles[loadIdx].color.w;
+                sh_spin[lid] = particles[loadIdx].color.x;
+            } else {
+                sh_posM[lid] = vec4(0.0);
+                sh_charge[lid] = 0.0;
+                sh_ptype[lid] = 0.0;
+                sh_spin[lid] = 0.0;
+            }
+
+            // Synchronize: all threads must finish loading before any thread reads
+            barrier();
+
+            if (isActive) {
+                uint tileStart = tile * 256u;
+                uint tileEnd = min(tileStart + 256u, uint(numParticles));
+                uint count = tileEnd - tileStart;
+
+                for (uint j = 0u; j < count; j++) {
+                    uint globalJ = tileStart + j;
+                    if (globalJ == gid) continue;  // Skip self-interaction
+
+                    vec3 pos_j = sh_posM[j].xyz;
+                    float mass_j = sh_posM[j].w;
+                    float charge_j = sh_charge[j];
+                    int ptype_j = int(sh_ptype[j]);
+
+                    vec3 d = pos_j - pos_i;
+                    float dist_sq = dot(d, d) + soft_sq;
+                    float dist = sqrt(dist_sq);
+                    vec3 dir = d / dist;
+
+                    // Gravitational force
+                    if (gravityEnabled != 0) {
+                        float grav_mag = calcGravityMag(mass_j, dist, dist_sq);
+                        accNear += grav_mag * dir;
+                        // Add tangential component for spiral/vortex gravity types
+                        accNear += calcTangentialForce(d, dist, mass_j);
+                        // Gravitational potential (time dilation + energy diagnostics)
+                        phiNear -= G * mass_j / dist;
+
+                        // Frame dragging around spinning black holes: matter is
+                        // swept tangentially about the hole's spin axis (+Z)
+                        if (ptype_j == 7 && abs(sh_spin[j]) > 0.01) {
+                            vec3 tang = cross(vec3(0.0, 0.0, 1.0), -d);
+                            float tl = length(tang);
+                            if (tl > 0.001) {
+                                float fmag = clamp(sh_spin[j] * 12.0 * G * mass_j / (dist_sq * dist),
+                                                   -150.0, 150.0);
+                                accNear += (tang / tl) * fmag;
+                            }
+                        }
+                    }
+
+                    // Electromagnetic force (only for charged particles)
+                    if (emEnabled != 0 && abs(charge_i) > 0.01 && abs(charge_j) > 0.01) {
+                        float em_mag = calcEMForce(charge_i, charge_j, dist_sq);
+                        accNear += em_mag * dir;
+                    }
+
+                    // Strong nuclear force (quarks feel it strongly, nucleons weakly)
+                    if (strongForceEnabled != 0 && dist < strongRange * 3.0) {
+                        float strong_factor_j = getStrongForceFactor(ptype_j);
+                        float combined_factor = strong_factor_i * strong_factor_j;
+                        if (combined_factor > 0.0) {
+                            float strong_mag = calcStrongForce(dist) * combined_factor;
+                            accNear += strong_mag * dir;
+                        }
+                    }
+                }
+            }
+
+            // Synchronize: all threads must finish reading shared memory
+            // before the next near tile overwrites it
+            barrier();
+        }
+    }
+
+    // === FAR tiles: sub-monopoles with per-particle exact refinement ===
+    // (no barriers below, so per-thread control flow is unrestricted)
+    if (isActive) {
+        for (uint tile = 0u; tile < totalTiles; tile++) {
+            if (tile >= nearLo && tile <= nearHi) continue;
+            uint subBase = 2u * MAX_TILES_STORE + tile * 16u;
+
+            for (uint q = 0u; q < 8u; q++) {
+                vec4 sc = tilecom[subBase + 2u * q];
+                if (sc.w <= 0.0) continue;
+                vec4 se = tilecom[subBase + 2u * q + 1u];
+
+                vec3 d = sc.xyz - pos_i;
+                float dist_sq = dot(d, d) + soft_sq;
+                float dist = sqrt(dist_sq);
+
+                if (dist < 1.5 * se.x + 2.0 * softening) {
+                    // Refine: this sub-clump subtends too large an angle
+                    // (or straddles a Morton discontinuity right next to
+                    // us) - sum its 32 particles exactly
+                    uint s0 = tile * 256u + q * 32u;
+                    uint s1 = min(s0 + 32u, uint(numParticles));
+                    for (uint j = s0; j < s1; j++) {
+                        if (j == gid) continue;
+                        vec4 pj = particles[j].posM;
+                        vec3 dj = pj.xyz - pos_i;
+                        float dj_sq = dot(dj, dj) + soft_sq;
+                        float dj_len = sqrt(dj_sq);
+                        vec3 dj_dir = dj / dj_len;
+
+                        if (gravityEnabled != 0) {
+                            accFar += calcGravityMag(pj.w, dj_len, dj_sq) * dj_dir;
+                            accFar += calcTangentialForce(dj, dj_len, pj.w);
+                            phiFar -= G * pj.w / dj_len;
+                            float spin_j = particles[j].color.x;
+                            if (int(particles[j].color.w) == 7 && abs(spin_j) > 0.01) {
+                                vec3 tangF = cross(vec3(0.0, 0.0, 1.0), -dj);
+                                float tlF = length(tangF);
+                                if (tlF > 0.001) {
+                                    float fmagF = clamp(spin_j * 12.0 * G * pj.w / (dj_sq * dj_len),
+                                                        -150.0, 150.0);
+                                    accFar += (tangF / tlF) * fmagF;
+                                }
+                            }
+                        }
+                        if (emEnabled != 0 && abs(charge_i) > 0.01) {
+                            float qj = particles[j].vel.w;
+                            if (abs(qj) > 0.01)
+                                accFar += calcEMForce(charge_i, qj, dj_sq) * dj_dir;
+                        }
+                        if (strongForceEnabled != 0 && dj_len < strongRange * 3.0 &&
+                            strong_factor_i > 0.0) {
+                            float sfj = getStrongForceFactor(int(particles[j].color.w));
+                            if (sfj > 0.0)
+                                accFar += calcStrongForce(dj_len) * strong_factor_i * sfj * dj_dir;
+                        }
+                    }
+                } else {
+                    // Monopole: mass (and net charge, for EM) at the sub COM
+                    vec3 dir = d / dist;
+                    if (gravityEnabled != 0) {
+                        accFar += calcGravityMag(sc.w, dist, dist_sq) * dir;
+                        accFar += calcTangentialForce(d, dist, sc.w);
+                        phiFar -= G * sc.w / dist;
+                    }
+                    if (emEnabled != 0 && abs(charge_i) > 0.01 && abs(se.y) > 0.01) {
+                        accFar += calcEMForce(charge_i, se.y, dist_sq) * dir;
+                    }
+                }
+            }
+        }
+    }
+
+    vec3 acc = accNear + accFar + accEnv;
+    float localPotential = phiNear + phiFar;
+
+    if (alive) {
+        // Dark matter halo
+        if (darkMatterEnabled != 0) {
+            float r = length(pos_i) + 1.0;
+            float scale = 1.0 + r / 100.0;
+            float dm_force = darkMatterStrength * 1000.0 / (r * scale * scale);
+            acc -= dm_force * pos_i / r;
+        }
+
+        // Spacetime expansion (Hubble's law: v = H * d)
+        // Dark energy causes space itself to expand, pushing particles apart
+        if (expansionEnabled != 0) {
+            float r = length(pos_i);
+            if (r > 1.0) {
+                // Hubble velocity: recession velocity proportional to distance
+                vec3 expansionVel = hubbleConstant * pos_i;
+                // Add as acceleration (gradual effect)
+                acc += expansionVel * 0.1;
+            }
+        }
+
+        // Relativistic correction to acceleration
+        // As particles approach speed of light, their effective mass increases
+        // This makes them harder to accelerate further (gamma factor)
+        if (relativityEnabled != 0) {
+            float v = length(vel_i);
+            float c = speedOfLight;
+            if (v > 0.01 * c) {
+                // Lorentz factor: gamma = 1 / sqrt(1 - v^2/c^2)
+                float v_over_c = v / c;
+                float gamma = 1.0 / sqrt(max(1.0 - v_over_c * v_over_c, 0.001));
+                // Effective acceleration reduced by gamma^3 for longitudinal acceleration
+                // (simplified to gamma for transverse, average effect)
+                acc /= gamma;
+            }
+        }
+
+        // Clamp acceleration
+        float accMag = length(acc);
+        if (accMag > 1000.0) {
+            acc = acc * (1000.0 / accMag);
+        }
+
+        // NaN/Inf check
+        if (isnan(acc.x) || isnan(acc.y) || isnan(acc.z) ||
+            isinf(acc.x) || isinf(acc.y) || isinf(acc.z)) {
+            acc = vec3(0.0);
+        }
+
+        // Calculate effective time step with gravitational time dilation
+        // In GR: dt_proper = dt_coordinate * sqrt(1 + 2*phi/c^2) ~ dt * (1 + phi/c^2)
+        // Deep in gravitational wells, time runs slower
+        float effectiveDt = dt;
+        if (relativityEnabled != 0) {
+            float c2 = speedOfLight * speedOfLight;
+            // Gravitational time dilation factor (phi is negative, so this slows time)
+            float timeDilationFactor = sqrt(max(1.0 + 2.0 * localPotential / c2, 0.1));
+            effectiveDt = dt * timeDilationFactor;
+        }
+
+        // ============================================================
+        // VELOCITY VERLET (2nd-order symplectic)
+        //
+        // Rearranged per-step form using the stored acceleration from
+        // the previous step:
+        //   v_n     = v_{n-1}' + 1/2 (a_{n-1} + a_n) dt   (complete the kick)
+        //   x_{n+1} = x_n + v_n dt + 1/2 a_n dt^2          (drift)
+        // Much better energy conservation than symplectic Euler at the
+        // cost of one persistent acceleration buffer.
+        // ============================================================
+        vec3 accPrev = accbuf[gid].xyz;
+        vel_i += 0.5 * (accPrev + acc) * effectiveDt;
+
+        // Clamp velocity (respect speed of light if relativity enabled)
+        float velMag = length(vel_i);
+        float maxSpeed = (relativityEnabled != 0) ? speedOfLight * 0.999 : 500.0;
+        if (velMag > maxSpeed) {
+            vel_i = vel_i * (maxSpeed / velMag);
+        }
+
+        // Drift with current acceleration
+        pos_i += vel_i * effectiveDt + 0.5 * acc * effectiveDt * effectiveDt;
+
+        // Apply damping
+        if (damping > 0.0) {
+            vel_i *= (1.0 - damping * dt);
+        }
+
+        // Boundary handling
+        if (boundaryMode == 1) {
+            float r = length(pos_i);
+            if (r > boundaryRadius) {
+                vec3 norm = pos_i / r;
+                vel_i = reflect(vel_i, norm);
+                pos_i = norm * boundaryRadius * 0.99;
+            }
+        } else if (boundaryMode == 2) {
+            pos_i = mod(pos_i + boundaryRadius, boundaryRadius * 2.0) - boundaryRadius;
+        }
+
+        // Final NaN/Inf recovery
+        if (isnan(pos_i.x) || isnan(pos_i.y) || isnan(pos_i.z) ||
+            isinf(pos_i.x) || isinf(pos_i.y) || isinf(pos_i.z)) {
+            pos_i = vec3(0.0);
+        }
+        if (isnan(vel_i.x) || isnan(vel_i.y) || isnan(vel_i.z) ||
+            isinf(vel_i.x) || isinf(vel_i.y) || isinf(vel_i.z)) {
+            vel_i = vec3(1.0, 1.0, 0.5);
+        }
+
+        // Write back (preserve charge and particle type)
+        particles[gid].posM.xyz = pos_i;
+        particles[gid].vel.xyz = vel_i;
+        accbuf[gid] = vec4(acc, localPotential);
+
+        // Report this compact object's exact end-of-frame state to the CPU
+        if (pp.emitBH != 0 && (ptype_i == 7 || ptype_i == 8) && mass_i > 0.0) {
+            int slot = atomicAdd(bhOutCount.x, 1);
+            if (slot < 16) {
+                bhOutData[2 * slot] = vec4(pos_i, mass_i);
+                bhOutData[2 * slot + 1] = vec4(float(gid), charge_i, particles[gid].color.x,
+                                               float(ptype_i));
+            }
+        }
+    }
+
+    // ============================================================
+    // DIAGNOSTICS REDUCTION (energy, momentum)
+    //
+    // Reuses sh_posM as reduction scratch - two sequential tree
+    // reductions so no extra shared memory is needed. All threads
+    // (including inactive) participate to satisfy barrier() rules.
+    // PE uses the Newtonian potential and is halved to undo pair
+    // double-counting.
+    // ============================================================
+    barrier();
+    float ke = alive ? 0.5 * mass_i * dot(vel_i, vel_i) : 0.0;
+    float pe = alive ? 0.5 * mass_i * localPotential : 0.0;
+    sh_posM[lid] = vec4(ke, pe, alive ? mass_i : 0.0, alive ? 1.0 : 0.0);
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (lid < s) sh_posM[lid] += sh_posM[lid + s];
+        barrier();
+    }
+    if (lid == 0u) diag[4u * wg] = sh_posM[0];
+    barrier();
+
+    sh_posM[lid] = alive ? vec4(mass_i * vel_i, length(vel_i)) : vec4(0.0);
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (lid < s) sh_posM[lid] += sh_posM[lid + s];
+        barrier();
+    }
+    if (lid == 0u) diag[4u * wg + 1u] = sh_posM[0];
+    barrier();
+
+    sh_posM[lid] = alive ? vec4(mass_i * pos_i.x * pos_i.x, mass_i * pos_i.y * pos_i.y,
+                                mass_i * pos_i.z * pos_i.z, mass_i * pos_i.x * pos_i.y)
+                         : vec4(0.0);
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (lid < s) sh_posM[lid] += sh_posM[lid + s];
+        barrier();
+    }
+    if (lid == 0u) diag[4u * wg + 2u] = sh_posM[0];
+    barrier();
+
+    sh_posM[lid] = alive ? vec4(mass_i * pos_i.x * pos_i.z, mass_i * pos_i.y * pos_i.z, 0.0, 0.0)
+                         : vec4(0.0);
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (lid < s) sh_posM[lid] += sh_posM[lid + s];
+        barrier();
+    }
+    if (lid == 0u) diag[4u * wg + 3u] = sh_posM[0];
+}

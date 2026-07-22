@@ -1,0 +1,121 @@
+#version 450
+
+// ============================================================
+// TILE CENTER-OF-MASS REDUCTION
+//
+// One workgroup per 256-particle tile. Cooperatively reduces
+// the tile to a monopole: center of mass + total mass.
+// The physics shader uses these as a deterministic far-field
+// approximation for tiles it does not process exactly.
+// ============================================================
+
+layout(local_size_x = 256) in;
+
+struct Particle {
+    vec4 posM;   // position.xyz + mass
+    vec4 vel;    // velocity.xyz + charge
+    vec4 color;  // rgb + particle type
+};
+
+layout(std430, binding = 0) readonly buffer Particles {
+    Particle particles[];
+};
+
+layout(binding = 1) uniform SimUBO {
+    float G;
+    float softening;
+    float dt;
+    int numParticles;
+    int gravityType;
+    float darkMatterStrength;
+    int darkMatterEnabled;
+    float simTime;
+    float damping;
+    float centralMass;
+    float boundaryRadius;
+    int boundaryMode;
+    int gravityEnabled;
+    int emEnabled;
+    int strongForceEnabled;
+    float emStrength;
+    float strongStrength;
+    float strongRange;
+    int relativityEnabled;
+    int expansionEnabled;
+    float speedOfLight;
+    float hubbleConstant;
+};
+
+// Layout must match physics.comp:
+//   [0 .. 2T):                     per-tile aggregates: (COM, mass), (radius, net charge, -, -)
+//   [2*MAX_TILES_STORE + t*16 ..): eight 32-particle sub-monopoles per tile
+const uint MAX_TILES_STORE = 1954u;
+layout(std430, binding = 3) buffer TileCOM {
+    vec4 tilecom[];
+};
+
+shared vec4 sh_sum[256];    // reduction scratch
+shared vec3 sh_subcom[8];   // per-sub COM for the radius pass
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+    uint tile = gl_WorkGroupID.x;
+    uint idx = tile * 256u + lid;
+    bool have = (idx < uint(numParticles));
+    uint sub = lid / 32u;
+
+    vec3 pos = have ? particles[idx].posM.xyz : vec3(0.0);
+    float mass = have ? particles[idx].posM.w : 0.0;
+    float charge = have ? particles[idx].vel.w : 0.0;
+
+    // Pass 1: mass-weighted position sums. Reducing within each 32-lane
+    // block first yields the sub-monopole sums; the aggregate is their total.
+    sh_sum[lid] = vec4(pos * mass, mass);
+    barrier();
+    for (uint s = 16u; s > 0u; s >>= 1u) {
+        if ((lid & 31u) < s) sh_sum[lid] += sh_sum[lid + s];
+        barrier();
+    }
+    // sh_sum[32*q] now holds sub q's (sum m*pos, sum m)
+    if (lid < 8u) {
+        vec4 sv = sh_sum[lid * 32u];
+        vec3 scom = (sv.w > 0.0) ? sv.xyz / sv.w : vec3(0.0);
+        sh_subcom[lid] = scom;
+        tilecom[2u * MAX_TILES_STORE + tile * 16u + 2u * lid] = vec4(scom, sv.w);
+    }
+    barrier();
+
+    vec4 agg = sh_sum[0] + sh_sum[32] + sh_sum[64] + sh_sum[96] +
+               sh_sum[128] + sh_sum[160] + sh_sum[192] + sh_sum[224];
+    float totalMass = agg.w;
+    vec3 com = (totalMass > 0.0) ? agg.xyz / totalMass : vec3(0.0);
+    barrier();
+
+    // Pass 2: bounding radii (max distance from own COM) + net charges,
+    // again per 32-lane block; x reduces by max, y by sum
+    sh_sum[lid] = vec4(have ? length(pos - sh_subcom[sub]) : 0.0, charge,
+                       have ? length(pos - com) : 0.0, 0.0);
+    barrier();
+    for (uint s = 16u; s > 0u; s >>= 1u) {
+        if ((lid & 31u) < s) {
+            sh_sum[lid] = vec4(max(sh_sum[lid].x, sh_sum[lid + s].x),
+                               sh_sum[lid].y + sh_sum[lid + s].y,
+                               max(sh_sum[lid].z, sh_sum[lid + s].z), 0.0);
+        }
+        barrier();
+    }
+    if (lid < 8u) {
+        vec4 sv = sh_sum[lid * 32u];
+        tilecom[2u * MAX_TILES_STORE + tile * 16u + 2u * lid + 1u] = vec4(sv.x, sv.y, 0.0, 0.0);
+    }
+    if (lid == 0u) {
+        float aggRadius = 0.0;
+        float aggCharge = 0.0;
+        for (uint q = 0u; q < 8u; q++) {
+            aggRadius = max(aggRadius, sh_sum[q * 32u].z);
+            aggCharge += sh_sum[q * 32u].y;
+        }
+        tilecom[2u * tile] = vec4(com, totalMass);
+        tilecom[2u * tile + 1u] = vec4(aggRadius, aggCharge, 0.0, 0.0);
+    }
+}
