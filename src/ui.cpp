@@ -31,16 +31,112 @@ void buildMenuText(std::vector<TextVertex>& vertices) {
     vertices.clear();
     if ((!app.showMenu && !app.showInstruments) || app.fontCharWidth == 0) return;
 
-    // UI scale tracks the window in real time: glyphs render at integer
-    // multiples of the 8x12 bitmap (nearest-neighbour, always crisp).
-    // Scale k is chosen so the full menu layout fits at k; floor is 1x.
-    int uiScale = std::max(1, std::min((int)app.swapchainExtent.width / 1600,
-                                       (int)app.swapchainExtent.height / 950));
-    float charW = (float)(app.fontCharWidth * uiScale) / app.swapchainExtent.width * 2.0f;
-    float charH = (float)(app.fontCharHeight * uiScale) / app.swapchainExtent.height * 2.0f;
-    float px = 2.0f * uiScale / app.swapchainExtent.height;   // one UI pixel in NDC (vertical)
-    float texCharW = 1.0f / 16.0f;
-    float texCharH = 1.0f / 16.0f;
+    // ---- Menu content (defined up front so the scale fits it exactly) ----
+    struct MenuDef {
+        const char* title;
+        const char* shortcut;  // Keyboard shortcut to display
+        int itemCount;
+        const char** items;
+        int* value;
+        bool* boolValue;  // For toggle items
+        bool isToggle;
+    };
+    static const char* gravityItems[] = {"Newtonian", "Inv Linear", "Linear", "Constant",
+                                   "Repulsive", "Oscillating", "Inv Cube", "Logarithmic",
+                                   "Yukawa", "Lennard-Jones", "Spiral", "Pulse",
+                                   "Quantized", "Funnel", "Vortex", "Rubber Band"};
+    static const char* distItems[] = {"Sphere", "Disk", "Shell", "Random", "Binary", "Solar",
+                               "Ring", "Cluster", "Filament", "Explosion", "Vortex", "Grid",
+                               "Plummer", "Figure-8", "Accretion", "Quasar", "Tidal",
+                               "Halo"};
+    static const char* massItems[] = {"Uniform", "Random", "Central", "Binary", "Hierarchical",
+                               "Power Law", "Stars+Gas", "Clusters"};
+    static const char* forceItems[] = {"OFF", "ON"};
+    static const char* matterItems[] = {"Generic", "Atoms", "Plasma", "Quarks", "Mixed", "Fundamental"};
+
+    MenuDef menus[] = {
+        {"Grav", "G", GRAVITY_COUNT, gravityItems, &app.gravityType, nullptr, false},
+        {"Dist", "F", DIST_COUNT, distItems, &app.distribution, nullptr, false},
+        {"Mass", "M", MASS_COUNT, massItems, &app.massMode, nullptr, false},
+        {"Col", "C", COLOR_COUNT, colorNames, &app.colorMode, nullptr, false},
+        {"Mat", "P", MATTER_COUNT, matterItems, &app.particleMode, nullptr, false},
+        {"Pre", "1-0", PRESET_COUNT, presetNames, &app.currentPreset, nullptr, false},
+        {"EM", "F2", 2, forceItems, nullptr, &app.emEnabled, true},
+        {"Str", "F3", 2, forceItems, nullptr, &app.strongForceEnabled, true},
+        {"Rel", "F5", 2, forceItems, nullptr, &app.relativityEnabled, true},
+        {"Exp", "F6", 2, forceItems, nullptr, &app.expansionEnabled, true},
+        {"Auto", "F9", 2, forceItems, nullptr, &app.displayMode, true},
+    };
+    int numMenus = 11;
+
+    static const char* row2Names[] = {
+        "G", "Soft", "Time", "Part", "H", "c", "Lens", "Bnd", "Trail", "Dark",
+        "Glow", "BHm", "Mrg", "Sky", "BHq", "BHs"
+    };
+    // Reserved value widths (worst case per entry) keep the bar static
+    // while scrolling: G 200 / Soft 50.0 / Time 5.0x / Part 500.0k /
+    // H 0.100 / c 2000 / Lens 3.0 / Bnd Reflect / ON-OFF / Glow 2.00 /
+    // BHm 1000k / Mrg ON(999999) / Sky / BHq +50 / BHs +1.0
+    static const int row2MaxVal[16] = {3, 4, 4, 6, 5, 4, 3, 7, 3, 3,
+                                       4, 5, 10, 3, 3, 4};
+
+    // Per-menu longest option (full length - values are never truncated)
+    int menuMaxVal[16];
+    for (int m = 0; m < numMenus; m++) {
+        int mv = 3;   // "OFF"
+        if (!menus[m].isToggle)
+            for (int i = 0; i < menus[m].itemCount; i++)
+                mv = std::max(mv, (int)strlen(menus[m].items[i]));
+        menuMaxVal[m] = mv;
+    }
+
+    // ---- Font size + bar layout: quantum steps through Spleen ----
+    // Pick the largest native size whose bars fit in ONE row each; if
+    // even the smallest can't, allow TWO rows per bar (wrap, never hide)
+    // and again take the largest that fits. Native bitmaps only.
+    float topWc[16], botWc[16];
+    for (int m = 0; m < numMenus; m++) {
+        char lbuf[32];
+        snprintf(lbuf, sizeof(lbuf), "%s(%s):", menus[m].title, menus[m].shortcut);
+        topWc[m] = (int)strlen(lbuf) + menuMaxVal[m] + 0.8f;   // + pad
+    }
+    for (int v = 0; v < 16; v++)
+        botWc[v] = (float)((int)strlen(row2Names[v]) + 1 + row2MaxVal[v]);
+    auto rowsFor = [&](const float* wArr, int n, float gap, float first, float rest) {
+        int rows = 1;
+        float x = 0, avail = first;
+        for (int i = 0; i < n; i++) {
+            float need = wArr[i] + (x > 0 ? gap : 0.0f);
+            if (x > 0 && x + need > avail) { rows++; avail = rest; x = wArr[i]; }
+            else x += need;
+        }
+        return rows;
+    };
+    int sw = (int)app.swapchainExtent.width, sh = (int)app.swapchainExtent.height;
+    int pick = 0, topRows = 2, botRows = 2;
+    for (int maxRows = 1; maxRows <= 2; maxRows++) {
+        bool found = false;
+        for (int s = SPLEEN_SIZES - 1; s >= 0 && !found; s--) {
+            float ca = (float)sw / spleenW[s];   // window width in chars
+            int tr = rowsFor(topWc, numMenus, 0.3f, ca - 30.0f, ca - 2.0f);
+            int br = rowsFor(botWc, 16, 0.8f, ca - 17.0f, ca - 17.0f);
+            bool heightOK = (1.5f * tr + 1.3f * br) * spleenH[s] <= 0.30f * sh;
+            if (tr <= maxRows && br <= maxRows && heightOK) {
+                pick = s; topRows = tr; botRows = br; found = true;
+            }
+        }
+        if (found) break;
+        if (maxRows == 2) { pick = 0; topRows = 2; botRows = 2; }  // elide fallback
+    }
+    app.fontSizeIdx = pick;
+    app.fontCharWidth = spleenW[pick];
+    app.fontCharHeight = spleenH[pick];
+    float charW = 2.0f * spleenW[pick] / sw;
+    float charH = 2.0f * spleenH[pick] / sh;
+    float px = std::max(1, spleenH[pick] / 12) * 2.0f / sh;  // hairline
+    float topRowHt = charH * 1.5f;   // menu-bar row height
+    float botRowHt = charH * 1.3f;   // variable-bar row height
+    float row0Bot = -1.0f + topRowHt;
 
     // Convert mouse position to NDC
     float mouseNdcX = screenToNdcX(app.mouseX);
@@ -48,14 +144,21 @@ void buildMenuText(std::vector<TextVertex>& vertices) {
     app.hoverPanelBtn = -1;
 
     auto addChar = [&](float x, float y, char c, float r, float g, float b, float a) {
-        if (c < 32 || c > 127) c = '?';
-        int col = c % 16;
-        int row = c / 16;
-        float u0 = col * texCharW;
-        float v0 = row * texCharH;
-        float u1 = u0 + texCharW;
-        float v1 = v0 + texCharH;
+        if (c < 32 || c > 126) c = '?';
+        int gi = c - 32;
+        int col = gi % 16, grow = gi / 16;
+        int fw = spleenW[app.fontSizeIdx], fh = spleenH[app.fontSizeIdx];
+        float u0 = (float)(col * fw) / app.fontTexWidth;
+        float v0 = (float)(app.fontSizeYOff[app.fontSizeIdx] + grow * fh) / app.fontTexHeight;
+        float u1 = u0 + (float)fw / app.fontTexWidth;
+        float v1 = v0 + (float)fh / app.fontTexHeight;
 
+        // Snap the glyph origin to the pixel grid so identical characters
+        // always sample the atlas identically (crisp at any scale)
+        x = floorf((x + 1.0f) * 0.5f * app.swapchainExtent.width + 0.5f)
+            / app.swapchainExtent.width * 2.0f - 1.0f;
+        y = floorf((y + 1.0f) * 0.5f * app.swapchainExtent.height + 0.5f)
+            / app.swapchainExtent.height * 2.0f - 1.0f;
         vertices.push_back({x, y, u0, v0, r, g, b, a});
         vertices.push_back({x + charW, y, u1, v0, r, g, b, a});
         vertices.push_back({x, y + charH, u0, v1, r, g, b, a});
@@ -130,7 +233,7 @@ void buildMenuText(std::vector<TextVertex>& vertices) {
         float panelH = headerH + charH * 1.25f * 3.0f + graphH + charH * 1.0f;
         float x2 = 1.0f - charW * 0.5f;
         float x1 = x2 - panelW;
-        float y2 = 1.0f - charH * 1.9f;   // sits just above the bottom variable row
+        float y2 = 1.0f - botRowHt * botRows - charH * 0.6f;   // above the bottom bar
         float y1 = y2 - panelH;
 
         addRectGrad(x1, y1, x2, y2, theme::panelTop, theme::panelBot);
@@ -294,7 +397,7 @@ void buildMenuText(std::vector<TextVertex>& vertices) {
     // ============================================================
     // TOP MENU BAR - glass gradient, hairline border, drop shadow
     // ============================================================
-    float menuBarHeight = charH * 1.5f;
+    float menuBarHeight = topRowHt * topRows;
     float menuBarTop = -1.0f + menuBarHeight;  // Top of screen in NDC is -1 (inverted Y)
 
     addRectGrad(-1.0f, -1.0f, 1.0f, menuBarTop, theme::panelTop, theme::panelBot);
@@ -307,44 +410,6 @@ void buildMenuText(std::vector<TextVertex>& vertices) {
     float itemPadding = charW * 0.8f;
 
     char buf[128];
-    struct MenuDef {
-        const char* title;
-        const char* shortcut;  // Keyboard shortcut to display
-        int itemCount;
-        const char** items;
-        int* value;
-        bool* boolValue;  // For toggle items
-        bool isToggle;
-    };
-
-    // Define menu items
-    const char* gravityItems[] = {"Newtonian", "Inv Linear", "Linear", "Constant",
-                                   "Repulsive", "Oscillating", "Inv Cube", "Logarithmic",
-                                   "Yukawa", "Lennard-Jones", "Spiral", "Pulse",
-                                   "Quantized", "Funnel", "Vortex", "Rubber Band"};
-    const char* distItems[] = {"Sphere", "Disk", "Shell", "Random", "Binary", "Solar",
-                               "Ring", "Cluster", "Filament", "Explosion", "Vortex", "Grid",
-                               "Plummer", "Figure-8", "Accretion", "Quasar", "Tidal",
-                               "Halo"};
-    const char* massItems[] = {"Uniform", "Random", "Central", "Binary", "Hierarchical",
-                               "Power Law", "Stars+Gas", "Clusters"};
-    const char* forceItems[] = {"OFF", "ON"};
-    const char* matterItems[] = {"Generic", "Atoms", "Plasma", "Quarks", "Mixed", "Fundamental"};
-
-    MenuDef menus[] = {
-        {"Grav", "G", GRAVITY_COUNT, gravityItems, &app.gravityType, nullptr, false},
-        {"Dist", "F", DIST_COUNT, distItems, &app.distribution, nullptr, false},
-        {"Mass", "M", MASS_COUNT, massItems, &app.massMode, nullptr, false},
-        {"Col", "C", COLOR_COUNT, colorNames, &app.colorMode, nullptr, false},
-        {"Mat", "P", MATTER_COUNT, matterItems, &app.particleMode, nullptr, false},
-        {"Pre", "1-0", PRESET_COUNT, presetNames, &app.currentPreset, nullptr, false},
-        {"EM", "F2", 2, forceItems, nullptr, &app.emEnabled, true},
-        {"Str", "F3", 2, forceItems, nullptr, &app.strongForceEnabled, true},
-        {"Rel", "F5", 2, forceItems, nullptr, &app.relativityEnabled, true},
-        {"Exp", "F6", 2, forceItems, nullptr, &app.expansionEnabled, true},
-        {"Auto", "F9", 2, forceItems, nullptr, &app.displayMode, true},
-    };
-    int numMenus = 11;
 
     app.hoverMenu = -1;
     app.hoverDropdownItem = -1;
@@ -362,8 +427,20 @@ void buildMenuText(std::vector<TextVertex>& vertices) {
     // when it is docked up here. Items that no longer fit are elided into
     // a ">>" marker instead of overlapping (keyboard shortcuts still work
     // for hidden items).
-    bool insChip = app.showInstruments && app.instrMinimized && app.diag.valid;
-    float menuLimit = 1.0f - 14.0f * charW - (insChip ? 13.0f * charW : 0.0f) - charW;
+    float menuLimit = 1.0f - 14.0f * charW - 13.0f * charW - charW;
+
+    // Justify: spread the leftover width evenly between items so spacing
+    // is uniform (depends only on reserved widths + window, never values)
+    float slotsW = 0;
+    for (int m = 0; m < numMenus; m++) {
+        char lbuf[32];
+        snprintf(lbuf, sizeof(lbuf), "%s(%s):", menus[m].title, menus[m].shortcut);
+        slotsW += (strlen(lbuf) + menuMaxVal[m]) * charW + itemPadding;
+    }
+    float menuGap = std::clamp((menuLimit - (-1.0f + charW) - slotsW) / (numMenus - 1),
+                               charW * 0.3f, charW * 6.0f);
+    if (topRows > 1) menuGap = charW * 0.6f;
+    int curRow = 0;
 
     // Draw menu bar items. Each slot reserves room for the LONGEST value
     // in its option set, so scrolling through options never shifts the
@@ -377,22 +454,9 @@ void buildMenuText(std::vector<TextVertex>& vertices) {
             currentValue = menus[m].items[*menus[m].value];
         }
 
-        // Slot width fits the longest option, capped at 12 chars so the
-        // whole bar fits; longer names display truncated with '~' (the
-        // dropdown always shows them in full)
-        const int VAL_CAP = 12;
-        int maxValLen = 3;   // "OFF"
-        if (!menus[m].isToggle)
-            for (int i = 0; i < menus[m].itemCount; i++)
-                maxValLen = std::max(maxValLen, (int)strlen(menus[m].items[i]));
-        maxValLen = std::min(maxValLen, VAL_CAP);
-        char valDisp[16];
-        if ((int)strlen(currentValue) > VAL_CAP) {
-            memcpy(valDisp, currentValue, VAL_CAP - 1);
-            valDisp[VAL_CAP - 1] = '~';
-            valDisp[VAL_CAP] = 0;
-            currentValue = valDisp;
-        }
+        // Slot reserves the full longest option - nothing is truncated;
+        // the UI scale guarantees the whole bar fits
+        int maxValLen = menuMaxVal[m];
 
         // Layout: "Title(Key):Value" - label dim, value bright
         snprintf(buf, sizeof(buf), "%s(%s):", menus[m].title, menus[m].shortcut);
@@ -400,14 +464,23 @@ void buildMenuText(std::vector<TextVertex>& vertices) {
         float itemWidth = (labelLen + maxValLen) * charW + itemPadding;
 
         float x1 = menuX;
-        float y1 = -1.0f;
         float x2 = menuX + itemWidth;
-        float y2 = menuBarTop;
-
-        if (x2 > menuLimit) {   // out of room - elide the rest
-            addText(menuX, menuY, ">>", theme::dim, 1.0f);
-            break;
+        float limit = (curRow == 0) ? menuLimit : 1.0f - charW;
+        if (x2 > limit + charW * 0.6f) {
+            if (curRow + 1 < topRows) {          // wrap onto the next bar row
+                curRow++;
+                menuX = -1.0f + charW;
+                x1 = menuX;
+                x2 = menuX + itemWidth;
+            } else {                             // out of room - elide the rest
+                addText(menuX, -1.0f + curRow * topRowHt + charH * 0.25f,
+                        ">>", theme::dim, 1.0f);
+                break;
+            }
         }
+        float y1 = -1.0f + curRow * topRowHt;
+        float y2 = y1 + topRowHt;
+        float itemTextY = y1 + charH * 0.25f;
 
         bool hovered = isHovered(x1, y1, x2, y2);
         bool isOpen = (app.openMenu == m);
@@ -426,12 +499,12 @@ void buildMenuText(std::vector<TextVertex>& vertices) {
         }
 
         float tx = menuX + charW * 0.75f;
-        addText(tx, menuY, buf, (hovered || isOpen) ? theme::bright : theme::dim, 1.0f);
+        addText(tx, itemTextY, buf, (hovered || isOpen) ? theme::bright : theme::dim, 1.0f);
         tx += labelLen * charW;
         const float* valCol = menus[m].isToggle
             ? (toggleOn ? theme::amber : theme::dim)
             : theme::value;
-        addText(tx, menuY, currentValue, valCol, 1.0f);
+        addText(tx, itemTextY, currentValue, valCol, 1.0f);
 
         // Store dropdown info for later drawing (if open)
         if (isOpen && !menus[m].isToggle) {
@@ -447,7 +520,7 @@ void buildMenuText(std::vector<TextVertex>& vertices) {
             pendingDropdown = {dropX, dropY, dropWidth, dropHeight, m, true};
         }
 
-        menuX += itemWidth + charW * 0.3f;
+        menuX += itemWidth + menuGap;
     }
 
     // Stats readout (right side of menu bar)
@@ -471,12 +544,12 @@ void buildMenuText(std::vector<TextVertex>& vertices) {
         snprintf(chip, sizeof(chip), "dE%+.1f%%", drift);
         float chipW = (strlen(chip) + 4) * charW;
         float cx1 = statsX - chipW - charW;
-        bool cHov = isHovered(cx1, -1.0f, cx1 + chipW, menuBarTop);
+        bool cHov = isHovered(cx1, -1.0f, cx1 + chipW, row0Bot);
         if (cHov) {
             app.hoverPanelBtn = 2;
-            addRect(cx1, -1.0f, cx1 + chipW, menuBarTop,
+            addRect(cx1, -1.0f, cx1 + chipW, row0Bot,
                     theme::cyan[0], theme::cyan[1], theme::cyan[2], 0.12f);
-            addRect(cx1, menuBarTop - 2.0f * px, cx1 + chipW, menuBarTop,
+            addRect(cx1, row0Bot - 2.0f * px, cx1 + chipW, row0Bot,
                     theme::cyan[0], theme::cyan[1], theme::cyan[2], 0.75f);
         }
         addText(cx1 + charW * 0.5f, menuY, "INS", cHov ? theme::bright : theme::dim, 1.0f);
@@ -486,7 +559,7 @@ void buildMenuText(std::vector<TextVertex>& vertices) {
     // ============================================================
     // BOTTOM VARIABLE BAR - scroll over a value to adjust it
     // ============================================================
-    float row2Height = charH * 1.3f;
+    float row2Height = botRowHt * botRows;
     float row2Bottom = 1.0f;  // Bottom of screen in NDC
     float row2Y = row2Bottom - row2Height;
 
@@ -497,19 +570,18 @@ void buildMenuText(std::vector<TextVertex>& vertices) {
     const char* boundaryNames[] = {"None", "Reflect", "Wrap"};
 
     // Build row2 items individually so we can track hover
+    // (index corresponds to hoverRow2Var: 0=G ... 15=BH spin)
     float row2X = -1.0f + charW * 0.75f;
     float row2TextY = row2Y + charH * 0.2f;
 
-    // Row2 variable definitions (index corresponds to hoverRow2Var)
-    // 0=G, 1=Soft, 2=Time, 3=Part, 4=Hubble, 5=c, 6=Lens, 7=Bound, 8=Trail, 9=Dark,
-    // 10=Glow, 11=BH mass, 12=Merge, 13=Starfield, 14=BH charge, 15=BH spin
-    const char* row2Names[] = {
-        "G", "Soft", "Time", "Part", "H", "c", "Lens", "Bnd", "Trail", "Dark",
-        "Glow", "BHm", "Mrg", "Sky", "BHq", "BHs"
-    };
-
-    bool gwChip = app.showInstruments && app.gwMinimized && !app.gwPlus.empty();
-    float row2Limit = 1.0f - (gwChip ? 14.0f * charW : 0.0f) - charW;
+    float row2Limit = 1.0f - 14.0f * charW - charW;
+    float row2Slots = 0;
+    for (int v = 0; v < 16; v++)
+        row2Slots += (strlen(row2Names[v]) + 1 + row2MaxVal[v]) * charW;
+    float row2Gap = std::clamp((row2Limit - (-1.0f + charW * 0.75f) - row2Slots) / 15.0f,
+                               charW * 0.8f, charW * 6.0f);
+    if (botRows > 1) row2Gap = charW * 0.8f;
+    int curRow2 = 0;
 
     for (int v = 0; v < 16; v++) {
         char valBuf[32];
@@ -539,39 +611,43 @@ void buildMenuText(std::vector<TextVertex>& vertices) {
             case 15: snprintf(valBuf, sizeof(valBuf), "%+.1f", app.blackHoleSpin); break;
         }
 
-        // Reserved value widths (worst case per entry) keep the bar static
-        // while scrolling: G 200 / Soft 50.0 / Time 5.0x / Part 500.0k /
-        // H 0.100 / c 2000 / Lens 3.0 / Bnd Reflect / ON-OFF / Glow 2.00 /
-        // BHm 1000k / Mrg ON(999999) / Sky / BHq +50 / BHs +1.0
-        static const int row2MaxVal[16] = {3, 4, 4, 6, 5, 4, 3, 7, 3, 3,
-                                           4, 5, 10, 3, 3, 4};
         int nameLen = (int)strlen(row2Names[v]) + 1;   // +1 for the ':'
         float varWidth = (nameLen + row2MaxVal[v]) * charW;
         float x1 = row2X;
         float x2 = row2X + varWidth;
-
-        if (x2 > row2Limit) {   // out of room - elide the rest
-            addText(row2X, row2TextY, ">>", theme::dim, 1.0f);
-            break;
+        if (x2 > row2Limit + charW * 0.6f) {
+            if (curRow2 + 1 < botRows) {         // wrap onto the next bar row
+                curRow2++;
+                row2X = -1.0f + charW * 0.75f;
+                x1 = row2X;
+                x2 = row2X + varWidth;
+            } else {                             // out of room - elide the rest
+                addText(row2X, row2Y + curRow2 * botRowHt + charH * 0.2f,
+                        ">>", theme::dim, 1.0f);
+                break;
+            }
         }
+        float rTop = row2Y + curRow2 * botRowHt;
+        float rBot = rTop + botRowHt;
+        float itemTextY2 = rTop + charH * 0.2f;
 
-        bool hovered = isHovered(x1, row2Y, x2, row2Bottom);
+        bool hovered = isHovered(x1, rTop, x2, rBot);
         if (hovered) {
             app.hoverRow2Var = v;
-            addRect(x1 - charW * 0.3f, row2Y + px, x2 + charW * 0.3f, row2Bottom,
+            addRect(x1 - charW * 0.3f, rTop + px, x2 + charW * 0.3f, rBot,
                     theme::cyan[0], theme::cyan[1], theme::cyan[2], 0.12f);
-            addRect(x1 - charW * 0.3f, row2Y + px, x2 + charW * 0.3f, row2Y + 3.0f * px,
+            addRect(x1 - charW * 0.3f, rTop + px, x2 + charW * 0.3f, rTop + 3.0f * px,
                     theme::cyan[0], theme::cyan[1], theme::cyan[2], 0.85f);
         }
 
         char nameBuf[16];
         snprintf(nameBuf, sizeof(nameBuf), "%s:", row2Names[v]);
-        addText(row2X, row2TextY, nameBuf, hovered ? theme::bright : theme::dim, 1.0f);
+        addText(row2X, itemTextY2, nameBuf, hovered ? theme::bright : theme::dim, 1.0f);
         const float* valCol = isToggle ? (isOn ? theme::amber : theme::dim)
                                        : (hovered ? theme::bright : theme::value);
-        addText(row2X + nameLen * charW, row2TextY, valBuf, valCol, 1.0f);
+        addText(row2X + nameLen * charW, itemTextY2, valBuf, valCol, 1.0f);
 
-        row2X += varWidth + charW * 1.6f;  // Space between items
+        row2X += varWidth + row2Gap;
     }
 
     // Minimized GW observatory: live strain chip at the right end of the bar
@@ -584,16 +660,18 @@ void buildMenuText(std::vector<TextVertex>& vertices) {
         snprintf(chip, sizeof(chip), "h %.1e", peak);
         float chipW = (strlen(chip) + 4) * charW;
         float cx1 = 1.0f - chipW - charW * 0.5f;
-        bool cHov = isHovered(cx1, row2Y, cx1 + chipW, row2Bottom);
+        float gwTop = row2Bottom - botRowHt;
+        float gwTextY = gwTop + charH * 0.2f;
+        bool cHov = isHovered(cx1, gwTop, cx1 + chipW, row2Bottom);
         if (cHov) {
             app.hoverPanelBtn = 4;
-            addRect(cx1, row2Y + px, cx1 + chipW, row2Bottom,
+            addRect(cx1, gwTop + px, cx1 + chipW, row2Bottom,
                     theme::cyan[0], theme::cyan[1], theme::cyan[2], 0.12f);
-            addRect(cx1, row2Y + px, cx1 + chipW, row2Y + 3.0f * px,
+            addRect(cx1, gwTop + px, cx1 + chipW, gwTop + 3.0f * px,
                     theme::cyan[0], theme::cyan[1], theme::cyan[2], 0.85f);
         }
-        addText(cx1 + charW * 0.5f, row2TextY, "GW", cHov ? theme::bright : theme::dim, 1.0f);
-        addText(cx1 + charW * 3.5f, row2TextY, chip,
+        addText(cx1 + charW * 0.5f, gwTextY, "GW", cHov ? theme::bright : theme::dim, 1.0f);
+        addText(cx1 + charW * 3.5f, gwTextY, chip,
                 theme::amber, 1.0f);
     }
 
@@ -649,19 +727,6 @@ void buildMenuText(std::vector<TextVertex>& vertices) {
             itemY += charH * 1.2f;
         }
     }
-}
-
-void renderText(SDL_Renderer* r, TTF_Font* f, const char* text, int x, int y, SDL_Color c) {
-    if (!f) return;
-    SDL_Surface* surf = TTF_RenderText_Blended(f, text, c);
-    if (!surf) return;
-    SDL_Texture* tex = SDL_CreateTextureFromSurface(r, surf);
-    if (tex) {
-        SDL_Rect dst = {x, y, surf->w, surf->h};
-        SDL_RenderCopy(r, tex, nullptr, &dst);
-        SDL_DestroyTexture(tex);
-    }
-    SDL_FreeSurface(surf);
 }
 
 void printHelp() {

@@ -77,7 +77,7 @@ Generic matter, Electrons, Protons, Neutrons, Up/Down Quarks, Positrons, Black H
 ## Building
 
 ### Dependencies
-- Vulkan SDK, SDL2, SDL2_ttf, glslc or glslangValidator, g++ with C++17
+- Vulkan SDK, SDL2, glslc or glslangValidator, g++ with C++17
 
 ### Linux
 ```bash

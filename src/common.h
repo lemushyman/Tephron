@@ -14,7 +14,6 @@
 #include <vulkan/vulkan.h>
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_vulkan.h>
-#include <SDL2/SDL_ttf.h>
 
 #include <cmath>
 #include <cstdio>
@@ -299,6 +298,11 @@ struct TextVertex {
     float u, v;      // texture coordinates
     float r, g, b, a; // color
 };
+
+// Spleen font family: six native bitmap sizes, smallest to largest
+#define SPLEEN_SIZES 6
+extern const int spleenW[SPLEEN_SIZES];
+extern const int spleenH[SPLEEN_SIZES];
 
 struct App {
     SDL_Window* window = nullptr;
@@ -611,7 +615,6 @@ struct App {
     char gpuName[256] = "Unknown GPU";
 
     // Text rendering
-    TTF_Font* font = nullptr;
     bool menuDirty = true;
 
     // Vulkan text overlay
@@ -628,6 +631,8 @@ struct App {
     int textVertexCount = 0;
     int fontTexWidth = 0, fontTexHeight = 0;
     int fontCharWidth = 0, fontCharHeight = 0;
+    int fontSizeIdx = 2;                 // current Spleen size (index)
+    int fontSizeYOff[6] = {};            // atlas Y offset per size
 };
 
 extern App app;

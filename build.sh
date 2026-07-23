@@ -5,7 +5,6 @@
 # Requirements:
 #   - Vulkan SDK (vulkan-devel or libvulkan-dev)
 #   - SDL2 (libsdl2-dev)
-#   - SDL2_ttf (libsdl2-ttf-dev)
 #   - GLSL compiler (glslc from Vulkan SDK, or glslangValidator)
 #   - g++ with C++17 support
 #
@@ -16,7 +15,7 @@
 #   sudo pacman -S vulkan-devel sdl2 sdl2_ttf glslang
 #
 # Install on Fedora:
-#   sudo dnf install vulkan-devel SDL2-devel SDL2_ttf-devel glslang
+#   sudo dnf install vulkan-devel SDL2-devel glslang
 #
 
 set -e
@@ -90,7 +89,7 @@ if [ $MISSING -eq 1 ]; then
     echo "  sudo pacman -S base-devel vulkan-devel sdl2 sdl2_ttf glslang"
     echo ""
     echo "Fedora:"
-    echo "  sudo dnf install gcc-c++ vulkan-devel SDL2-devel SDL2_ttf-devel glslang"
+    echo "  sudo dnf install gcc-c++ vulkan-devel SDL2-devel glslang"
     exit 1
 fi
 
@@ -140,7 +139,7 @@ g++ -std=c++17 -O3 -mtune=generic \
     -Wall -Wextra -Wno-missing-field-initializers \
     src/*.cpp \
     -o tephron \
-    $SDL2_CFLAGS $SDL2_LIBS -lSDL2_ttf \
+    $SDL2_CFLAGS $SDL2_LIBS \
     $VULKAN_CFLAGS $VULKAN_LIBS \
     -lm -lpthread
 

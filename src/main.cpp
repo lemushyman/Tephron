@@ -127,7 +127,6 @@ int main(int argc, char** argv) {
     }
 
     if (SDL_Init(SDL_INIT_VIDEO) < 0) return 1;
-    if (TTF_Init() < 0) return 1;
 
     // Dev convenience: GRAV_WINPOS="x,y" positions the window explicitly
     // (pair with SDL_VIDEODRIVER=x11 - Wayland ignores client positioning).
@@ -353,6 +352,15 @@ int main(int argc, char** argv) {
         runSortStateMachine();
         renderFrame();
         renderMenu();
+
+        // Paused = static scene, but MAILBOX presents uncapped: without a
+        // throttle the GPU redraws an unchanged frame at full power (coil
+        // whine at 150W for nothing). ~60 FPS keeps camera/UI interaction
+        // fluid while paused and lets the card idle.
+        if (app.paused) {
+            uint32_t frameSpent = SDL_GetTicks() - frameNow;
+            if (frameSpent < 16) SDL_Delay(16 - frameSpent);
+        }
 
         // Screenshot request (F12 or --screenshot on the final frame)
         if (app.screenshotRequested) {

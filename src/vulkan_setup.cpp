@@ -1057,7 +1057,6 @@ void cleanup() {
     vkDestroyInstance(app.instance, nullptr);
 
     SDL_DestroyWindow(app.window);
-    TTF_Quit();
     SDL_Quit();
 }
 
