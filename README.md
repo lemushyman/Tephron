@@ -12,14 +12,22 @@
 
 *A quasar's accretion disk seen edge-on through its black hole's lens. Nothing here is painted: every ray is real simulated matter, bent by the point-mass lens equation in the composite pass. ([mp4](assets/gravitational-lensing-demo.mp4))*
 
-## Gallery
+## Video Gallery
 
-| | |
-|---|---|
-| ![Binary black holes](shots/binary-black-holes.png) | ![Spiral galaxy](shots/spiral-galaxy.png) |
-| *Binary black holes carving a star halo — live GW strain traces bottom-left* | *Spiral galaxy with comet trails, oblique view* |
-| ![Quasar shadow](shots/quasar-shadow.png) | ![Plasma storm](shots/plasma-storm.png) |
-| *Staring into a feeding quasar's shadow* | *Charged holes species-sorting an ionized disk (red protons, blue electrons)* |
+Animated previews are lossless WebP; click one for the full-resolution,
+60 FPS, silent video.
+
+[![A black hole disrupting a spiral galaxy](assets/gallery/spiral-black-hole.webp)](assets/gallery/spiral-black-hole.mp4)
+
+*A black hole disrupting a spiral galaxy — live GW strain traces bottom-left.*
+
+[![A swarm of black holes in a stellar halo](assets/gallery/black-hole-swarm.webp)](assets/gallery/black-hole-swarm.mp4)
+
+*A black-hole swarm carving through a stellar halo.*
+
+[![An edge-on feeding quasar](assets/gallery/edge-on-quasar.webp)](assets/gallery/edge-on-quasar.mp4)
+
+*An edge-on feeding quasar, with the photon ring emerging entirely from lensed matter.*
 
 ## Features
 
