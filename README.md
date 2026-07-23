@@ -8,11 +8,11 @@
 
 ## Demo of Gravitational Lensing
 
-![Demo of gravitational lensing](assets/gravitational-lensing-demo.webp)
+[![An edge-on feeding quasar](assets/gallery/edge-on-quasar.webp)](assets/gallery/edge-on-quasar.mp4)
 
-*A quasar's accretion disk seen edge-on through its black hole's lens. Nothing here is painted: every ray is real simulated matter, bent by the point-mass lens equation in the composite pass. ([mp4](assets/gravitational-lensing-demo.mp4))*
+*An edge-on feeding quasar, with the photon ring emerging entirely from lensed matter. Nothing here is painted: every ray is real simulated matter, bent by the point-mass lens equation in the composite pass. Click for the full-resolution, 60 FPS, silent video.*
 
-## Video Gallery
+## Gallery
 
 Animated previews are lossless WebP; click one for the full-resolution,
 60 FPS, silent video.
@@ -21,13 +21,13 @@ Animated previews are lossless WebP; click one for the full-resolution,
 
 *A black hole disrupting a spiral galaxy — live GW strain traces bottom-left.*
 
+![A spiral galaxy seen obliquely](assets/gallery/galaxy-screenshot.png)
+
+*A 50,000-particle spiral galaxy seen obliquely, with live conservation and gravitational-wave instruments.*
+
 [![A swarm of black holes in a stellar halo](assets/gallery/black-hole-swarm.webp)](assets/gallery/black-hole-swarm.mp4)
 
 *A black-hole swarm carving through a stellar halo.*
-
-[![An edge-on feeding quasar](assets/gallery/edge-on-quasar.webp)](assets/gallery/edge-on-quasar.mp4)
-
-*An edge-on feeding quasar, with the photon ring emerging entirely from lensed matter.*
 
 ## Features
 
