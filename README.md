@@ -6,7 +6,7 @@
 
 **Tephron** is a real-time N-body particle simulator built with Vulkan compute shaders. Simulates gravitational, electromagnetic, and nuclear forces with volumetric glow rendering, gravitationally lensed black holes, and a live conservation-law instrument panel.
 
-## Demo of Gravitational Lensing
+## Gravitational Lensing Demo
 
 [![An edge-on feeding quasar](assets/gallery/edge-on-quasar.webp)](assets/gallery/edge-on-quasar.mp4)
 
