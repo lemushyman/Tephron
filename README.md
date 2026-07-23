@@ -8,7 +8,7 @@
 
 ## Demo of Gravitational Lensing
 
-[![An edge-on feeding quasar](assets/gallery/edge-on-quasar.webp)](assets/gallery/edge-on-quasar.mp4)
+<a href="assets/gallery/edge-on-quasar.mp4"><img src="assets/gallery/edge-on-quasar.webp" alt="An edge-on feeding quasar" width="640" height="400"></a>
 
 *An edge-on feeding quasar, with the photon ring emerging entirely from lensed matter. Nothing here is painted: every ray is real simulated matter, bent by the point-mass lens equation in the composite pass. Click for the full-resolution, 60 FPS, silent video.*
 
@@ -17,17 +17,21 @@
 Animated previews are lossless WebP; click one for the full-resolution,
 60 FPS, silent video.
 
-[![A black hole disrupting a spiral galaxy](assets/gallery/spiral-black-hole.webp)](assets/gallery/spiral-black-hole.mp4)
+<a href="assets/gallery/spiral-black-hole.mp4"><img src="assets/gallery/spiral-black-hole.webp" alt="A black hole disrupting a spiral galaxy" width="640" height="400"></a>
 
 *A black hole disrupting a spiral galaxy — live GW strain traces bottom-left.*
 
-![A spiral galaxy seen obliquely](assets/gallery/galaxy-screenshot.png)
+<img src="assets/gallery/galaxy-screenshot.png" alt="A spiral galaxy seen obliquely" width="640" height="400">
 
 *A 50,000-particle spiral galaxy seen obliquely, with live conservation and gravitational-wave instruments.*
 
-[![A swarm of black holes in a stellar halo](assets/gallery/black-hole-swarm.webp)](assets/gallery/black-hole-swarm.mp4)
+<a href="assets/gallery/black-hole-swarm.mp4"><img src="assets/gallery/black-hole-swarm.webp" alt="A swarm of black holes in a stellar halo" width="640" height="400"></a>
 
 *A black-hole swarm carving through a stellar halo.*
+
+<a href="assets/gallery/black-hole-brink.mp4"><img src="assets/gallery/black-hole-brink.webp" alt="One black hole on the brink of swallowing another" width="640" height="400"></a>
+
+*One black hole skims the capture boundary of another, on the brink of being swallowed.*
 
 ## Features
 
